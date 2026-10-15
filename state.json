@@ -1,1 +1,1 @@
-{"alerts": [], "nid": 4, "offset": 658254293, "scan": {"active": {}, "err_ts": 0, "last": {}, "minvol": 5000000.0, "on": false, "pct": 2.0, "side": {}, "top": 150, "week": 0}}
+{"alerts": [{"armed": true, "dir": "up", "id": 4, "lvl": 0.004657, "next": 0, "note": "", "rep": false, "since": 1792076205.4352415, "sym": "PUMP", "ts": 1792076205.4352415}], "nid": 5, "offset": 658254295, "scan": {"active": {}, "err_ts": 0, "last": {}, "minvol": 5000000.0, "on": false, "pct": 2.0, "side": {}, "top": 150, "week": 0}}
