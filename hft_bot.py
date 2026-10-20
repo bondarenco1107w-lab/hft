@@ -131,13 +131,14 @@ def sr_levels(b4, bd, price):
     pts.sort()
     cl = []
     for p in pts:
-        if cl and abs(p - mean(cl[-1])) / p < 0.004:
+        if cl and abs(p - mean(cl[-1])) / p < 0.004 and (p - cl[-1][0]) / p < 0.006:
             cl[-1].append(p)
         else:
             cl.append([p])
-    lv = [(mean(c), len(c)) for c in cl]
-    res = sorted([x for x in lv if x[0] > price * 1.001])[:3]
-    sup = sorted([x for x in lv if x[0] < price * 0.999], reverse=True)[:3]
+    allv = [(mean(c), len(c), c[0], c[-1]) for c in cl]
+    strong = [x for x in allv if x[1] >= 2] or allv
+    res = sorted([x for x in strong if x[0] > price * 1.001])[:3]
+    sup = sorted([x for x in strong if x[0] < price * 0.999], reverse=True)[:3]
     return res, sup
 
 
@@ -171,12 +172,24 @@ def bias(s):
     return "bull" if sc >= 3 else "bear" if sc <= -3 else "mixed"
 
 
+def zone(mid, lo, hi):
+    return fmt(mid) if (hi - lo) / mid < 0.002 else f"{fmt(lo)}–{fmt(hi)}"
+
+
 def lv(items):
-    return ", ".join(fmt(p) for p, _ in items) if items else "нет ближайших"
+    return ", ".join(zone(m, lo, hi) for m, _, lo, hi in items) if items else "нет ближайших"
 
 
 def lv_touch(items):
-    return ", ".join(f"{fmt(p)} ({n} кас.)" for p, n in items) if items else "нет ближайших"
+    return ", ".join(f"{zone(m, lo, hi)} ({n} кас.)" for m, n, lo, hi in items) if items else "нет ближайших"
+
+
+def then(items):
+    return f", затем {lv(items)}" if items else ""
+
+
+def to(items):
+    return f" — к {lv(items)}" if items else ""
 
 
 def nearest_swing(b, price, above):
@@ -199,19 +212,37 @@ def report(a, other):
     bs = bias(s)
 
     L = [f"{NAMES[sym]} · {fmt(price)} · {time.strftime('%d.%m %H:%M', time.gmtime())} UTC", ""]
+    inv0 = nearest_swing(a["h4"], price, bs == "bear") if bs != "mixed" else None
+    if bs == "bull":
+        summ = f"Итог: перевес вверх, ближайшая цель {lv(a['res'][:1])}" + (f"; отмена при закрытии 4ч ниже {fmt(inv0)}." if inv0 else ".")
+    elif bs == "bear":
+        summ = f"Итог: перевес вниз, ближайшая цель {lv(a['sup'][:1])}" + (f"; отмена при закрытии 4ч выше {fmt(inv0)}." if inv0 else ".")
+    else:
+        summ = f"Итог: направления нет, ждём выхода из диапазона {lv(a['sup'][:1])} — {lv(a['res'][:1])}."
+    L += [summ, ""]
     L += ["📊 Тренд по Доу (структура максимумов и минимумов):"]
     L += [f"- {k}: {ST[v]}" for k, v in s.items()]
-    vals = set(s.values())
-    L.append("- Все таймфреймы согласованы." if len(vals) == 1 else
-             f"- Конфликт: старшие (1W/1D) {ST[s['1W']]}/{ST[s['1D']]}, младшие (4H/1H) {ST[s['4H']]}/{ST[s['1H']]}.")
+    dirs = {v for v in s.values() if v != "range"}
+    if len(dirs) == 2:
+        up = "/".join(k for k, v in s.items() if v == "bull")
+        dn = "/".join(k for k, v in s.items() if v == "bear")
+        L.append(f"- Конфликт: бычья на {up}, медвежья на {dn}.")
+    elif len(dirs) == 1:
+        d = dirs.pop()
+        tf = "/".join(k for k, v in s.items() if v == d)
+        rest = "/".join(k for k, v in s.items() if v != d)
+        L.append(f"- {ST[d].capitalize()} на {tf}" + (f", {rest} боковая: прямого конфликта нет." if rest else ": все таймфреймы согласованы."))
+    else:
+        L.append("- Все таймфреймы боковые.")
 
     L += ["", "🔄 Фаза рынка:", f"- {phase(s)}"]
 
     L += ["", "📐 Уровни (swing-точки 4H и 1D, число касаний):",
           f"- Сопротивления: {lv_touch(a['res'])}", f"- Поддержки: {lv_touch(a['sup'])}"]
 
+    imp = ("умеренно бычий" if r1 > 55 and r4[-1] > 55 else "умеренно медвежий" if r1 < 45 and r4[-1] < 45 else "нейтральный")
     L += ["", "⚡ Импульс:",
-          f"- RSI: 1H {r1:.0f}, 4H {r4[-1]:.0f}, 1D {rd:.0f}",
+          f"- RSI: 1H {r1:.0f}, 4H {r4[-1]:.0f}, 1D {rd:.0f} — {imp}",
           f"- MACD 4H: гистограмма {mh_t}",
           f"- Дивергенция RSI на 4H: {divergence(a['h4'], r4)}"]
 
@@ -256,21 +287,17 @@ def report(a, other):
     sup, res = a["sup"], a["res"]
     L += ["", "🧭 Сценарии:"]
     if bs == "bear":
-        inv = nearest_swing(a["h4"], price, True)
-        L.append(f"- Основной: снижение к {lv(sup[:2])}. Основание: 1D {ST[s['1D']]}, 4H {ST[s['4H']]}.")
-        L.append(f"- Где возможен разворот вверх: реакция у {lv(sup)}.")
-        L.append(f"- Альтернатива: откат к {lv(res[:1])}; если там отвергнут, снижение продолжается, если удержатся выше — к {lv(res[1:2])}.")
-        L.append(f"- Отменит основной: закрытие 4ч выше {fmt(inv)}." if inv else "- Отменит основной: закрепление выше ближайшего сопротивления.")
+        L.append(f"- Основной: снижение к {lv(sup[:1])}{then(sup[1:2])}; там возможен разворот вверх. Основание: 1D {ST[s['1D']]}, 4H {ST[s['4H']]}.")
+        L.append(f"- Альтернатива: откат к {lv(res[:1])}; если там отвергнут, снижение продолжается, если удержатся выше{to(res[1:2])}.")
+        L.append(f"- Отменит основной: закрытие 4ч выше {fmt(inv0)}." if inv0 else "- Отменит основной: закрепление выше ближайшего сопротивления.")
     elif bs == "bull":
-        inv = nearest_swing(a["h4"], price, False)
-        L.append(f"- Основной: рост к {lv(res[:2])}. Основание: 1D {ST[s['1D']]}, 4H {ST[s['4H']]}.")
-        L.append(f"- Где возможен разворот вниз: реакция у {lv(res)}.")
-        L.append(f"- Альтернатива: откат к {lv(sup[:1])}; если там удержатся, рост продолжается, если пробьют — к {lv(sup[1:2])}.")
-        L.append(f"- Отменит основной: закрытие 4ч ниже {fmt(inv)}." if inv else "- Отменит основной: закрепление ниже ближайшей поддержки.")
+        L.append(f"- Основной: рост к {lv(res[:1])}{then(res[1:2])}; там возможен разворот вниз. Основание: 1D {ST[s['1D']]}, 4H {ST[s['4H']]}.")
+        L.append(f"- Альтернатива: откат к {lv(sup[:1])}; если там удержатся, рост продолжается, если пробьют{to(sup[1:2])}.")
+        L.append(f"- Отменит основной: закрытие 4ч ниже {fmt(inv0)}." if inv0 else "- Отменит основной: закрепление ниже ближайшей поддержки.")
     else:
-        L.append("- Основной: боковик, направления нет, старшие и младшие таймфреймы спорят.")
-        L.append(f"- Выход вверх: закрытие 4ч выше {lv(res[:1])}, дальше {lv(res[1:2])}.")
-        L.append(f"- Выход вниз: закрытие 4ч ниже {lv(sup[:1])}, дальше {lv(sup[1:2])}.")
+        L.append("- Основной: боковик, направления нет, таймфреймы спорят.")
+        L.append(f"- Выход вверх: закрытие 4ч выше {lv(res[:1])}{then(res[1:2])}.")
+        L.append(f"- Выход вниз: закрытие 4ч ниже {lv(sup[:1])}{then(sup[1:2])}.")
 
     L += ["", "🔗 BTC и ETH:"]
     b_, e_ = (a, other) if sym == "BTC_USDT" else (other, a)
