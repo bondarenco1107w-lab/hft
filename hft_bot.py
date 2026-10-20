@@ -1,72 +1,335 @@
+import os
+import json
+import math
+import time
+import requests
 
-import os, json, math, time, requests
-from concurrent.futures import ThreadPoolExecutor
-
-TOKEN = os.environ["BOT_TOKEN"]; CHAT = os.environ["CHAT_ID"]
+TOKEN = os.environ["BOT_TOKEN"]
+CHAT = os.environ["CHAT_ID"]
 API = "https://api.gateio.ws/api/v4/futures/usdt/"
-N, TF, L, K = 100, 5, 100, 2.5
-STATE = "seen.json"
+TG = f"https://api.telegram.org/bot{TOKEN}"
+STATE = "state.json"
+NAMES = {"BTC_USDT": "BTC", "ETH_USDT": "ETH"}
+ST = {"bull": "бычья", "bear": "медвежья", "range": "боковая"}
+DIR = {"bull": "вверх", "bear": "вниз", "range": "боковик"}
+KEYBOARD = {"keyboard": [["BTC", "ETH", "Оба"]], "resize_keyboard": True, "is_persistent": True}
 
-def fv(v): return f"{v/1e6:.1f}м" if v >= 1e6 else f"{v/1e3:.0f}к"
 
-def tg(t):
+def fmt(x):
+    return f"{x:,.1f}".replace(",", " ")
+
+
+def mean(a):
+    return sum(a) / len(a) if a else 0.0
+
+
+# ---------- data ----------
+def get_candles(sym, interval, limit):
+    r = requests.get(API + "candlesticks", params={"contract": sym, "interval": interval, "limit": limit}, timeout=20)
+    r.raise_for_status()
+    return [{"t": int(x["t"]), "o": float(x["o"]), "h": float(x["h"]), "l": float(x["l"]),
+             "c": float(x["c"]), "v": float(x.get("v", 0))} for x in r.json()]
+
+
+def get_derivs(sym):
+    fr = oi = None
     try:
-        requests.get(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                     params={"chat_id": CHAT, "text": t, "disable_web_page_preview": "true"}, timeout=10)
+        c = requests.get(API + "contracts/" + sym, timeout=15).json()
+        fr = float(c["funding_rate"]) * 100
+    except Exception as e:
+        print("funding", e)
+    try:
+        st = requests.get(API + "contract_stats", params={"contract": sym, "interval": "1h", "limit": 25}, timeout=15).json()
+        st = sorted(st, key=lambda x: x["time"])
+        key = "open_interest_usd" if "open_interest_usd" in st[0] else "open_interest"
+        oi = (float(st[-1][key]) / float(st[0][key]) - 1) * 100
+    except Exception as e:
+        print("oi", e)
+    return fr, oi
+
+
+# ---------- indicators ----------
+def ema(vals, n):
+    k = 2 / (n + 1)
+    out = [vals[0]]
+    for v in vals[1:]:
+        out.append(v * k + out[-1] * (1 - k))
+    return out
+
+
+def rsi_series(c, n=14):
+    out = [50.0] * len(c)
+    if len(c) <= n:
+        return out
+    g = [max(c[i] - c[i - 1], 0) for i in range(1, len(c))]
+    l = [max(c[i - 1] - c[i], 0) for i in range(1, len(c))]
+    ag, al = sum(g[:n]) / n, sum(l[:n]) / n
+    out[n] = 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+    for i in range(n, len(g)):
+        ag = (ag * (n - 1) + g[i]) / n
+        al = (al * (n - 1) + l[i]) / n
+        out[i + 1] = 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+    return out
+
+
+def atr(b, n=14):
+    tr = [max(b[i]["h"] - b[i]["l"], abs(b[i]["h"] - b[i - 1]["c"]), abs(b[i]["l"] - b[i - 1]["c"]))
+          for i in range(1, len(b))]
+    a = sum(tr[:n]) / n
+    for x in tr[n:]:
+        a = (a * (n - 1) + x) / n
+    return a
+
+
+def macd_hist(c):
+    line = [a - b for a, b in zip(ema(c, 12), ema(c, 26))]
+    sig = ema(line, 9)
+    return [x - y for x, y in zip(line, sig)]
+
+
+def pivots(b, n=3):
+    hi, lo = [], []
+    for i in range(n, len(b) - n):
+        if b[i]["h"] == max(x["h"] for x in b[i - n:i + n + 1]):
+            hi.append((i, b[i]["h"]))
+        if b[i]["l"] == min(x["l"] for x in b[i - n:i + n + 1]):
+            lo.append((i, b[i]["l"]))
+    return hi, lo
+
+
+def structure(b, n=3):
+    hi, lo = pivots(b, n)
+    if len(hi) < 2 or len(lo) < 2:
+        return "range"
+    uh, ul = hi[-1][1] > hi[-2][1], lo[-1][1] > lo[-2][1]
+    if uh and ul:
+        return "bull"
+    if not uh and not ul:
+        return "bear"
+    return "range"
+
+
+def divergence(b, rs, n=3):
+    hi, lo = pivots(b, n)
+    out = []
+    if len(hi) >= 2 and hi[-1][0] >= len(b) - 25:
+        (i1, p1), (i2, p2) = hi[-2], hi[-1]
+        if p2 > p1 and rs[i2] < rs[i1]:
+            out.append("медвежья (цена выше, RSI ниже)")
+    if len(lo) >= 2 and lo[-1][0] >= len(b) - 25:
+        (i1, p1), (i2, p2) = lo[-2], lo[-1]
+        if p2 < p1 and rs[i2] > rs[i1]:
+            out.append("бычья (цена ниже, RSI выше)")
+    return ", ".join(out) if out else "нет"
+
+
+def sr_levels(b4, bd, price):
+    pts = []
+    for b, n in ((b4, 3), (bd, 2)):
+        hi, lo = pivots(b, n)
+        pts += [p for _, p in hi[-40:]] + [p for _, p in lo[-40:]]
+    pts.sort()
+    cl = []
+    for p in pts:
+        if cl and abs(p - mean(cl[-1])) / p < 0.004:
+            cl[-1].append(p)
+        else:
+            cl.append([p])
+    lv = [(mean(c), len(c)) for c in cl]
+    res = sorted([x for x in lv if x[0] > price * 1.001])[:3]
+    sup = sorted([x for x in lv if x[0] < price * 0.999], reverse=True)[:3]
+    return res, sup
+
+
+# ---------- analysis ----------
+def analyze(sym):
+    w, d = get_candles(sym, "7d", 100), get_candles(sym, "1d", 200)
+    h4, h1 = get_candles(sym, "4h", 300), get_candles(sym, "1h", 200)
+    price = h1[-1]["c"]
+    a = {"sym": sym, "price": price, "d": d, "h4": h4, "h1": h1}
+    a["s"] = {"1W": structure(w, 2), "1D": structure(d, 2), "4H": structure(h4, 3), "1H": structure(h1, 3)}
+    a["res"], a["sup"] = sr_levels(h4, d, price)
+    a["fr"], a["oi"] = get_derivs(sym)
+    return a
+
+
+def phase(s):
+    sd, s4, s1 = s["1D"], s["4H"], s["1H"]
+    if sd in ("bull", "bear"):
+        if s4 == sd:
+            tail = "1H совпадает." if s1 == sd else "на 1H идёт откат против тренда."
+            return f"Тренд {DIR[sd]}: 1D и 4H в одну сторону, {tail}"
+        return f"Коррекция против тренда 1D ({DIR[sd]}): на 4H структура {ST[s4]}."
+    if s4 == "range":
+        return "Диапазон: 1D и 4H без выраженного направления."
+    return f"Выход из диапазона: 4H показывает {DIR[s4]}, 1D пока боковая."
+
+
+def bias(s):
+    w = {"1W": 1, "1D": 2, "4H": 2, "1H": 1}
+    sc = sum(w[k] * {"bull": 1, "bear": -1, "range": 0}[v] for k, v in s.items())
+    return "bull" if sc >= 3 else "bear" if sc <= -3 else "mixed"
+
+
+def lv(items):
+    return ", ".join(fmt(p) for p, _ in items) if items else "нет ближайших"
+
+
+def lv_touch(items):
+    return ", ".join(f"{fmt(p)} ({n} кас.)" for p, n in items) if items else "нет ближайших"
+
+
+def nearest_swing(b, price, above):
+    hi, lo = pivots(b, 3)
+    if above:
+        c = [p for _, p in hi if p > price]
+        return c[-1] if c else None
+    c = [p for _, p in lo if p < price]
+    return c[-1] if c else None
+
+
+def report(a, other):
+    sym, price, s = a["sym"], a["price"], a["s"]
+    h1c = [x["c"] for x in a["h1"]]
+    h4c = [x["c"] for x in a["h4"]]
+    dc = [x["c"] for x in a["d"]]
+    r1, r4, rd = rsi_series(h1c)[-1], rsi_series(h4c), rsi_series(dc)[-1]
+    mh = macd_hist(h4c)
+    mh_t = ("выше нуля" if mh[-1] > 0 else "ниже нуля") + (", растёт" if mh[-1] > mh[-2] else ", падает")
+    bs = bias(s)
+
+    L = [f"{NAMES[sym]} · {fmt(price)} · {time.strftime('%d.%m %H:%M', time.gmtime())} UTC", ""]
+    L += ["📊 Тренд по Доу (структура максимумов и минимумов):"]
+    L += [f"- {k}: {ST[v]}" for k, v in s.items()]
+    vals = set(s.values())
+    L.append("- Все таймфреймы согласованы." if len(vals) == 1 else
+             f"- Конфликт: старшие (1W/1D) {ST[s['1W']]}/{ST[s['1D']]}, младшие (4H/1H) {ST[s['4H']]}/{ST[s['1H']]}.")
+
+    L += ["", "🔄 Фаза рынка:", f"- {phase(s)}"]
+
+    L += ["", "📐 Уровни (swing-точки 4H и 1D, число касаний):",
+          f"- Сопротивления: {lv_touch(a['res'])}", f"- Поддержки: {lv_touch(a['sup'])}"]
+
+    L += ["", "⚡ Импульс:",
+          f"- RSI: 1H {r1:.0f}, 4H {r4[-1]:.0f}, 1D {rd:.0f}",
+          f"- MACD 4H: гистограмма {mh_t}",
+          f"- Дивергенция RSI на 4H: {divergence(a['h4'], r4)}"]
+
+    cl = a["d"][:-1]
+    vol_ratio = cl[-1]["v"] / mean([x["v"] for x in cl[-21:-1]]) if mean([x["v"] for x in cl[-21:-1]]) else 0
+    ua = mean([x["v"] for x in cl[-10:] if x["c"] >= x["o"]])
+    da = mean([x["v"] for x in cl[-10:] if x["c"] < x["o"]])
+    if ua > da * 1.15:
+        side, vtxt = "bull", "объём выше на растущих днях"
+    elif da > ua * 1.15:
+        side, vtxt = "bear", "объём выше на падающих днях"
+    else:
+        side, vtxt = "range", "объём на растущих и падающих днях примерно равный"
+    sd = s["1D"]
+    conf = "" if sd == "range" else (" — подтверждает тренд 1D." if side == sd else " — тренд 1D не подтверждает.")
+    ap = atr(a["d"]) / price * 100
+    L += ["", "📦 Объём и волатильность:",
+          f"- Объём закрытого дня {vol_ratio:.1f}x от среднего за 20 дней; за 10 дней {vtxt}{conf}",
+          f"- ATR 1D {ap:.1f}% — " + ("низкая" if ap < 2 else "средняя" if ap < 4 else "высокая") + " волатильность."]
+
+    L += ["", "🧮 Деривативы:"]
+    fr, oi = a["fr"], a["oi"]
+    if fr is None:
+        L.append("- Фандинг: нет данных.")
+    else:
+        ft = "лонги перегреты" if fr > 0.05 else "шорты перегружены" if fr < -0.02 else "нейтрально"
+        L.append(f"- Фандинг {fr:+.3f}% — {ft}.")
+    if oi is None:
+        L.append("- Открытый интерес: нет данных.")
+    else:
+        pch = (price / a["h1"][-25]["c"] - 1) * 100
+        if pch >= 0 and oi >= 0:
+            v = "цена и OI растут: приходят новые лонги, рост подтверждён"
+        elif pch >= 0:
+            v = "цена растёт, OI падает: рост за счёт закрытия шортов, он слабее"
+        elif oi >= 0:
+            v = "цена падает, OI растёт: приходят новые шорты, падение подтверждено"
+        else:
+            v = "цена и OI падают: закрытие лонгов, падение слабее"
+        L.append(f"- OI за 24ч {oi:+.1f}%, цена {pch:+.1f}%: {v}.")
+
+    sup, res = a["sup"], a["res"]
+    L += ["", "🧭 Сценарии:"]
+    if bs == "bear":
+        inv = nearest_swing(a["h4"], price, True)
+        L.append(f"- Основной: снижение к {lv(sup[:2])}. Основание: 1D {ST[s['1D']]}, 4H {ST[s['4H']]}.")
+        L.append(f"- Где возможен разворот вверх: реакция у {lv(sup)}.")
+        L.append(f"- Альтернатива: откат к {lv(res[:1])}; если там отвергнут, снижение продолжается, если удержатся выше — к {lv(res[1:2])}.")
+        L.append(f"- Отменит основной: закрытие 4ч выше {fmt(inv)}." if inv else "- Отменит основной: закрепление выше ближайшего сопротивления.")
+    elif bs == "bull":
+        inv = nearest_swing(a["h4"], price, False)
+        L.append(f"- Основной: рост к {lv(res[:2])}. Основание: 1D {ST[s['1D']]}, 4H {ST[s['4H']]}.")
+        L.append(f"- Где возможен разворот вниз: реакция у {lv(res)}.")
+        L.append(f"- Альтернатива: откат к {lv(sup[:1])}; если там удержатся, рост продолжается, если пробьют — к {lv(sup[1:2])}.")
+        L.append(f"- Отменит основной: закрытие 4ч ниже {fmt(inv)}." if inv else "- Отменит основной: закрепление ниже ближайшей поддержки.")
+    else:
+        L.append("- Основной: боковик, направления нет, старшие и младшие таймфреймы спорят.")
+        L.append(f"- Выход вверх: закрытие 4ч выше {lv(res[:1])}, дальше {lv(res[1:2])}.")
+        L.append(f"- Выход вниз: закрытие 4ч ниже {lv(sup[:1])}, дальше {lv(sup[1:2])}.")
+
+    L += ["", "🔗 BTC и ETH:"]
+    b_, e_ = (a, other) if sym == "BTC_USDT" else (other, a)
+    n = min(len(b_["d"]), len(e_["d"]))
+    ratio = [e_["d"][-n + i]["c"] / b_["d"][-n + i]["c"] for i in range(n)]
+    c7, c30 = (ratio[-1] / ratio[-8] - 1) * 100, (ratio[-1] / ratio[-31] - 1) * 100
+    rel = "ETH сильнее BTC" if c7 > 1 else "ETH слабее BTC" if c7 < -1 else "ETH и BTC идут вровень"
+    L.append(f"- 1D: BTC {ST[b_['s']['1D']]}, ETH {ST[e_['s']['1D']]}.")
+    L.append(f"- ETH/BTC за 7д {c7:+.1f}%, за 30д {c30:+.1f}%: {rel}.")
+    L += ["", "Обучающий разбор по формулам, не рекомендация."]
+    return "\n".join(L)
+
+
+# ---------- telegram ----------
+def send(text, keyboard=True):
+    body = {"chat_id": CHAT, "text": text}
+    if keyboard:
+        body["reply_markup"] = KEYBOARD
+    try:
+        requests.post(TG + "/sendMessage", json=body, timeout=15)
     except Exception as e:
         print("tg", e)
 
-def agg(d):
-    m = {}
-    for k in sorted(d, key=lambda x: x["t"]):
-        key = k["t"] // (TF * 60) * (TF * 60)
-        o, c, h, l, v = (float(k[x]) for x in "ochlv")
-        b = m.setdefault(key, dict(t=key, h=h, l=l, c=c, v=0.0, buy=0.0, pv=0.0))
-        b["h"] = max(b["h"], h); b["l"] = min(b["l"], l); b["c"] = c
-        b["v"] += v; b["pv"] += c * v
-        if c >= o: b["buy"] += v
-    return [m[k] for k in sorted(m)]
 
-def signal(bars, i):
-    if i < L - 1: return None
-    w = [x["v"] for x in bars[i-L+1:i+1]]
-    avg = sum(w) / L
-    sd = math.sqrt(sum((x - avg) ** 2 for x in w) / L)
-    b = bars[i]
-    if b["v"] <= 0 or sd == 0 or b["v"] < avg + K * sd: return None
-    bp = b["buy"] / b["v"] * 100; vw = b["pv"] / b["v"]; z = (b["v"] - avg) / sd
-    if bp > 55 and b["c"] < vw: return (-1, z, bp)
-    if bp < 45 and b["c"] > vw: return (1, z, bp)
-    return None
-
-def work(t):
-    s, out = t["contract"], []
+def main():
     try:
-        d = requests.get(API + "candlesticks", params={"contract": s, "interval": "1m",
-                         "limit": min(2000, (L + 20) * TF)}, timeout=20).json()
-        bars = agg(d)
-        if bars and bars[-1]["t"] + TF * 60 > time.time(): bars = bars[:-1]
-        for i in range(max(0, len(bars) - 3), len(bars)):
-            r = signal(bars, i)
-            if r: out.append((s, bars[i], r, t["last"]))
-    except Exception as e:
-        print(s, e)
-    return out
+        st = json.load(open(STATE))
+    except Exception:
+        st = {}
+    off = st.get("offset")
+    ups = requests.get(TG + "/getUpdates", params={"offset": off, "timeout": 0}, timeout=20).json().get("result", [])
+    if not ups:
+        return
+    want, greet = set(), False
+    for u in ups:
+        off = u["update_id"] + 1
+        m = u.get("message") or {}
+        if str(m.get("chat", {}).get("id")) != str(CHAT) or time.time() - m.get("date", 0) > 3600:
+            continue
+        t = (m.get("text") or "").strip().lower().lstrip("/")
+        if t in ("btc", "eth"):
+            want.add(t.upper() + "_USDT")
+        elif t in ("оба", "both"):
+            want |= {"BTC_USDT", "ETH_USDT"}
+        elif t == "start":
+            greet = True
+    json.dump({"offset": off}, open(STATE, "w"))
+    if greet and not want:
+        send("Выбери монету кнопкой ниже. Отчёт приходит через 1-5 минут после нажатия.")
+    if want:
+        try:
+            data = {s: analyze(s) for s in ("BTC_USDT", "ETH_USDT")}
+            for s in ("BTC_USDT", "ETH_USDT"):
+                if s in want:
+                    send(report(data[s], data["ETH_USDT" if s == "BTC_USDT" else "BTC_USDT"]))
+        except Exception as e:
+            print("report", e)
+            send("Не получилось собрать отчёт, попробуй нажать ещё раз.")
 
-try: seen = json.load(open(STATE))
-except Exception: seen = {}
-tk = requests.get(API + "tickers", timeout=20).json()
-tk.sort(key=lambda x: float(x["volume_24h_quote"]), reverse=True)
-with ThreadPoolExecutor(8) as ex:
-    res = [x for r in ex.map(work, tk[:N]) for x in r]
-for s, b, (sg, z, bp), last in sorted(res, key=lambda x: x[1]["t"]):
-    key = f"{s}:{b['t']}:{sg}"
-    if key in seen: continue
-    seen[key] = b["t"]
-    link = f"https://www.gate.io/futures/USDT/{s}"
-    if sg < 0:
-        tg(f"🧱 АЙСБЕРГ МЕДВЕДЯ {s} ({TF}м)\nЦена {last}\nСопротивление {b['h']} · триггер паники {b['l']}\nОбъём {fv(b['v'])} · сила {z:.1f}σ · покупки {bp:.0f}%\n{link}")
-    else:
-        tg(f"🧱 АЙСБЕРГ БЫКА {s} ({TF}м)\nЦена {last}\nПоддержка {b['l']} · триггер паники {b['h']}\nОбъём {fv(b['v'])} · сила {z:.1f}σ · покупки {bp:.0f}%\n{link}")
-cut = time.time() - 86400
-json.dump({k: v for k, v in seen.items() if v > cut}, open(STATE, "w"))
+
+if __name__ == "__main__":
+    main()
