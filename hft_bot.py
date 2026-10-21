@@ -8,7 +8,6 @@ TOKEN = os.environ["BOT_TOKEN"]
 CHAT = os.environ["CHAT_ID"]
 API = "https://api.gateio.ws/api/v4/futures/usdt/"
 TG = f"https://api.telegram.org/bot{TOKEN}"
-STATE = "report_state.json"
 NAMES = {"BTC_USDT": "BTC", "ETH_USDT": "ETH"}
 ST = {"bull": "бычья", "bear": "медвежья", "range": "боковая"}
 DIR = {"bull": "вверх", "bear": "вниз", "range": "боковик"}
@@ -322,18 +321,9 @@ def send(text, keyboard=True):
         print("tg", e)
 
 
-def main():
-    try:
-        st = json.load(open(STATE))
-    except Exception:
-        st = {}
-    off = st.get("offset")
-    ups = requests.get(TG + "/getUpdates", params={"offset": off, "timeout": 0}, timeout=20).json().get("result", [])
-    if not ups:
-        return
+def handle(ups):
     want, greet = set(), False
     for u in ups:
-        off = u["update_id"] + 1
         m = u.get("message") or {}
         if str(m.get("chat", {}).get("id")) != str(CHAT) or time.time() - m.get("date", 0) > 3600:
             continue
@@ -344,9 +334,8 @@ def main():
             want |= {"BTC_USDT", "ETH_USDT"}
         elif t == "start":
             greet = True
-    json.dump({"offset": off}, open(STATE, "w"))
     if greet and not want:
-        send("Выбери монету кнопкой ниже. Отчёт приходит через 1-5 минут после нажатия.")
+        send("Выбери монету кнопкой ниже. Отчёт приходит примерно через минуту после нажатия.")
     if want:
         try:
             data = {s: analyze(s) for s in ("BTC_USDT", "ETH_USDT")}
@@ -356,6 +345,31 @@ def main():
         except Exception as e:
             print("report", e)
             send("Не получилось собрать отчёт, попробуй нажать ещё раз.")
+
+
+def main():
+    end = time.time() + int(os.environ.get("RUN_SECONDS", "21000"))
+    off = None
+    while time.time() < end:
+        try:
+            r = requests.get(TG + "/getUpdates", params={"offset": off, "timeout": 50}, timeout=65).json()
+        except Exception as e:
+            print("poll", e)
+            time.sleep(5)
+            continue
+        if not r.get("ok"):
+            print("poll", r)
+            time.sleep(5)
+            continue
+        ups = r.get("result", [])
+        if ups:
+            off = ups[-1]["update_id"] + 1
+            handle(ups)
+    if off is not None:
+        try:
+            requests.get(TG + "/getUpdates", params={"offset": off, "timeout": 0}, timeout=20)
+        except Exception as e:
+            print("confirm", e)
 
 
 if __name__ == "__main__":
