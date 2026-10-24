@@ -318,59 +318,91 @@ def report(a, other):
     i_hi = max(range(len(w7)), key=lambda i: w7[i]["h"])
     i_lo = min(range(len(w7)), key=lambda i: w7[i]["l"])
 
-    L = [f"{NAMES[sym]} · {fmt(price)} · {time.strftime('%d.%m %H:%M', time.gmtime())} UTC", ""]
-    if ksup and kres and bs == "bear":
-        summ = (f"Итог: уклон вниз, пока 4H не закрылся выше {fmt(kres[0][3])}. "
-                f"Вход — только после закрытия 4H ниже {fmt(ksup[0][2])}.")
-    elif ksup and kres and bs == "bull":
-        summ = (f"Итог: уклон вверх, пока 4H не закрылся ниже {fmt(ksup[0][2])}. "
-                f"Вход — только после закрытия 4H выше {fmt(kres[0][3])}.")
-    elif ksup and kres:
-        summ = f"Итог: направления нет, ждём выхода из диапазона {fmt(ksup[0][2])}–{fmt(kres[0][3])}."
+    def pc(x):
+        return f"{(x / price - 1) * 100:+.1f}%"
+
+    head = [f"{NAMES[sym]} · {fmt(price)} · {time.strftime('%d.%m %H:%M', time.gmtime())} UTC"]
+
+    # 1. Итог: что делать и от каких цен
+    top, scen = [], ["🧭 Сценарии:"]
+    if ksup and kres:
+        sz1, rz1 = ksup[0], kres[0]
+        dn_e = f"Вход вниз: закрытие 4H ниже {fmt(sz1[2])} ({pc(sz1[2])})"
+        up_e = f"Вход вверх: закрытие 4H выше {fmt(rz1[3])} ({pc(rz1[3])})"
+        if bs == "bear":
+            top += [f"Итог: уклон вниз, пока 4H не закрылся выше {fmt(rz1[3])}.", dn_e, up_e]
+        elif bs == "bull":
+            top += [f"Итог: уклон вверх, пока 4H не закрылся ниже {fmt(sz1[2])}.", up_e, dn_e]
+        else:
+            top += ["Итог: направления нет.", dn_e, up_e]
+        top.append("Пока цена между ними, входа нет.")
+
+        sz2 = next((z for z in ksup + sup if z[3] < sz1[2]), None)
+        rz2 = next((z for z in kres + res if z[2] > rz1[3]), None)
+        dn_stop, dn_tgt = sz1[3] * 1.001, (sz2[3] if sz2 else None)
+        up_stop, up_tgt = rz1[2] * 0.999, (rz2[2] if rz2 else None)
+
+        def sc(title, cond, tgt, stop, entry, cancel):
+            t = f"Цель {fmt(tgt)} · стоп {fmt(stop)} · {rr_text(entry, stop, tgt)}" if tgt else f"Цель не найдена · стоп {fmt(stop)}"
+            return [f"- {title}: {cond}", f"  {t}", f"  Отмена: {cancel}."]
+        down = sc("Вниз" + (" (основной)" if bs == "bear" else ""),
+                  f"закрытие 4H ниже {fmt(sz1[2])}, два подряд или ретест снизу.",
+                  dn_tgt, dn_stop, sz1[2], f"закрытие 4H выше {fmt(rz1[3])}")
+        up_ = sc("Вверх" + (" (основной)" if bs == "bull" else ""),
+                 f"закрытие 4H выше {fmt(rz1[3])}, два подряд или ретест сверху.",
+                 up_tgt, up_stop, rz1[3], f"закрытие 4H ниже {fmt(sz1[2])}")
+        scen += (up_ + down) if bs == "bull" else (down + up_)
     else:
-        summ = "Итог: недостаточно уровней для вывода."
-    L += [summ, ""]
-    L += ["📊 Тренд по Доу (структура максимумов и минимумов):"]
-    L += [f"- {k}: {ST[v]}" for k, v in s.items()]
+        top.append("Итог: недостаточно уровней для вывода.")
+        scen.append("- Недостаточно уровней для сценариев.")
+    ev = event_line()
+    if ev:
+        top.append(f"⚠️ {ev}")
+    sw = sweep(a["h4"], price, ksup, kres)
+    if sw:
+        top.append(sw)
+
+    # 2. Уровни
+    lev = ["📐 Уровни (swing-точки 4H и 1D, число касаний):",
+           f"- Сопротивления: {lv_touch(res[:3])}", f"- Поддержки: {lv_touch(sup[:3])}"]
+    if s["4H"] == "bear":
+        brk = last_swing(a["h4"], price, True)
+        part = f"выше {fmt(brk)} (последний swing-максимум 4H) структура 4H ломается; " if brk else ""
+        lev.append(f"- Ключевые: {part}ниже {fmt(lo7)} (мин 7д) продолжение вниз.")
+    elif s["4H"] == "bull":
+        brk = last_swing(a["h4"], price, False)
+        part = f"ниже {fmt(brk)} (последний swing-минимум 4H) структура 4H ломается; " if brk else ""
+        lev.append(f"- Ключевые: {part}выше {fmt(hi7)} (макс 7д) продолжение вверх.")
+    else:
+        lev.append(f"- Ключевые: макс 7д {fmt(hi7)}, мин 7д {fmt(lo7)}; выход за них задаёт направление.")
+
+    # 3. Тренд и фаза
+    tr = ["📊 Тренд по Доу (структура максимумов и минимумов):",
+          "- " + " · ".join(f"{k} {ST[v]}" for k, v in s.items())]
     dirs = {v for v in s.values() if v != "range"}
     if len(dirs) == 2:
         up = "/".join(k for k, v in s.items() if v == "bull")
         dn = "/".join(k for k, v in s.items() if v == "bear")
-        L.append(f"- Конфликт: бычья на {up}, медвежья на {dn}.")
+        tr.append(f"- Конфликт: бычья на {up}, медвежья на {dn}.")
     elif len(dirs) == 1:
         d = dirs.pop()
         tf = "/".join(k for k, v in s.items() if v == d)
         rest = "/".join(k for k, v in s.items() if v != d)
-        L.append(f"- {ST[d].capitalize()} на {tf}" + (f", {rest} боковая: прямого конфликта нет." if rest else ": все таймфреймы согласованы."))
+        tr.append(f"- {ST[d].capitalize()} на {tf}" + (f", {rest} боковая: прямого конфликта нет." if rest else ": все таймфреймы согласованы."))
     else:
-        L.append("- Все таймфреймы боковые.")
+        tr.append("- Все таймфреймы боковые.")
+    ph = ["🔄 Фаза рынка:", f"- {phase(s, hi7, lo7, i_hi, i_lo)}"]
 
-    L += ["", "🔄 Фаза рынка:", f"- {phase(s, hi7, lo7, i_hi, i_lo)}"]
-
-    L += ["", "📐 Уровни (swing-точки 4H и 1D, число касаний):",
-          f"- Сопротивления: {lv_touch(res[:3])}", f"- Поддержки: {lv_touch(sup[:3])}"]
-    if s["4H"] == "bear":
-        brk = last_swing(a["h4"], price, True)
-        part = f"выше {fmt(brk)} (последний swing-максимум 4H) структура 4H ломается; " if brk else ""
-        L.append(f"- Ключевые: {part}ниже {fmt(lo7)} (мин 7д) продолжение вниз.")
-    elif s["4H"] == "bull":
-        brk = last_swing(a["h4"], price, False)
-        part = f"ниже {fmt(brk)} (последний swing-минимум 4H) структура 4H ломается; " if brk else ""
-        L.append(f"- Ключевые: {part}выше {fmt(hi7)} (макс 7д) продолжение вверх.")
-    else:
-        L.append(f"- Ключевые: макс 7д {fmt(hi7)}, мин 7д {fmt(lo7)}; выход за них задаёт направление.")
-    sw = sweep(a["h4"], price, ksup, kres)
-    if sw:
-        L.append("- " + sw)
-
+    # 4. Импульс, объём, деривативы
     imp = ("умеренно бычий" if r1 > 55 and r4[-1] > 55 else "умеренно медвежий" if r1 < 45 and r4[-1] < 45 else "нейтральный")
-    L += ["", "⚡ Импульс:",
-          f"- RSI: 1H {r1:.0f}, 4H {r4[-1]:.0f}, 1D {rd:.0f} — {imp}",
-          f"- MACD 4H: гистограмма {mh_t}",
-          f"- Дивергенция RSI на 4H: {divergence(a['h4'], r4)}"]
+    mom = ["⚡ Импульс:",
+           f"- RSI: 1H {r1:.0f}, 4H {r4[-1]:.0f}, 1D {rd:.0f} — {imp}",
+           f"- MACD 4H: гистограмма {mh_t}",
+           f"- Дивергенция RSI на 4H: {divergence(a['h4'], r4)}"]
 
     cl = a["d"][:-1]
-    vol_ratio = cl[-1]["v"] / mean([x["v"] for x in cl[-21:-1]]) if mean([x["v"] for x in cl[-21:-1]]) else 0
+    vavg = mean([x["v"] for x in cl[-21:-1]])
+    vol_ratio = cl[-1]["v"] / vavg if vavg else 0
     ua = mean([x["v"] for x in cl[-10:] if x["c"] >= x["o"]])
     da = mean([x["v"] for x in cl[-10:] if x["c"] < x["o"]])
     if ua > da * 1.15:
@@ -386,19 +418,19 @@ def report(a, other):
     else:
         conf = " — подтверждает тренд 1D." if side == sd else " — тренд 1D не подтверждает."
     ap = atr(a["d"]) / price * 100
-    L += ["", "📦 Объём и волатильность:",
-          f"- Объём закрытого дня {vol_ratio:.1f}x от среднего за 20 дней{' — нейтрально' if vneutral else ''}; за 10 дней {vtxt}{conf}",
-          f"- ATR 1D {ap:.1f}% — " + ("низкая" if ap < 2 else "средняя" if ap < 4 else "высокая") + " волатильность."]
+    vol = ["📦 Объём и волатильность:",
+           f"- Объём закрытого дня {vol_ratio:.1f}x от среднего за 20 дней{' — нейтрально' if vneutral else ''}; за 10 дней {vtxt}{conf}",
+           f"- ATR 1D {ap:.1f}% — " + ("низкая" if ap < 2 else "средняя" if ap < 4 else "высокая") + " волатильность."]
 
-    L += ["", "🧮 Деривативы:"]
+    der = ["🧮 Деривативы:"]
     fr, oi = a["fr"], a["oi"]
     if fr is None:
-        L.append("- Фандинг: нет данных.")
+        der.append("- Фандинг: нет данных.")
     else:
         ft = "лонги перегреты" if fr > 0.05 else "шорты перегружены" if fr < -0.02 else "нейтрально"
-        L.append(f"- Фандинг {fr:+.3f}% — {ft}.")
+        der.append(f"- Фандинг {fr:+.3f}% — {ft}.")
     if oi is None:
-        L.append("- Открытый интерес: нет данных.")
+        der.append("- Открытый интерес: нет данных.")
     else:
         pch = (price / a["h1"][-25]["c"] - 1) * 100
         if pch >= 0 and oi >= 0:
@@ -409,46 +441,30 @@ def report(a, other):
             v = "цена падает, OI растёт: приходят новые шорты, падение подтверждено"
         else:
             v = "цена и OI падают: закрытие лонгов, падение слабее"
-        L.append(f"- OI за 24ч {oi:+.1f}%, цена {pch:+.1f}%: {v}.")
+        der.append(f"- OI за 24ч {oi:+.1f}%, цена {pch:+.1f}%: {v}.")
     if not a.get("liq"):
-        L.append("- Ликвидации за 6ч: нет данных.")
+        der.append("- Ликвидации за 6ч: нет данных.")
     else:
-        L.append(f"- Ликвидации за 6ч (не прогноз): выше цены {a['liq'][0] or 'нет'}; ниже {a['liq'][1] or 'нет'}.")
+        der.append(f"- Ликвидации за 6ч (не прогноз): выше цены {a['liq'][0] or 'нет'}; ниже {a['liq'][1] or 'нет'}.")
 
-    L += ["", "🧭 Сценарии:"]
-    if ksup and kres:
-        sz1, rz1 = ksup[0], kres[0]
-        sz2 = next((z for z in ksup + sup if z[3] < sz1[2]), None)
-        rz2 = next((z for z in kres + res if z[2] > rz1[3]), None)
-        dn_stop, dn_tgt = sz1[3] * 1.001, (sz2[3] if sz2 else None)
-        up_stop, up_tgt = rz1[2] * 0.999, (rz2[2] if rz2 else None)
-        down = (f"- Вниз{' (основной)' if bs == 'bear' else ''}: два закрытия 4H подряд ниже {fmt(sz1[2])} или ретест снизу. "
-                f"Цель {fmt(dn_tgt) if dn_tgt else 'не найдена'}, стоп {fmt(dn_stop)}, {rr_text(sz1[2], dn_stop, dn_tgt)}. "
-                f"Отмена: закрытие 4H выше {fmt(rz1[3])}.")
-        up_ = (f"- Вверх{' (основной)' if bs == 'bull' else ''}: два закрытия 4H подряд выше {fmt(rz1[3])} или ретест сверху. "
-               f"Цель {fmt(up_tgt) if up_tgt else 'не найдена'}, стоп {fmt(up_stop)}, {rr_text(rz1[3], up_stop, up_tgt)}. "
-               f"Отмена: закрытие 4H ниже {fmt(sz1[2])}.")
-        L += [up_, down] if bs == "bull" else [down, up_]
-        L.append(f"- Между {fmt(sz1[2])} и {fmt(rz1[3])} — боковик, сигнала нет.")
-    else:
-        L.append("- Недостаточно уровней для сценариев.")
-
-    L += ["", "🔗 BTC и ETH:"]
+    # 5. Связи
+    lnk = ["🔗 BTC и ETH:"]
     b_, e_ = (a, other) if sym == "BTC_USDT" else (other, a)
     n = min(len(b_["d"]), len(e_["d"]))
     ratio = [e_["d"][-n + i]["c"] / b_["d"][-n + i]["c"] for i in range(n)]
     c7, c30 = (ratio[-1] / ratio[-8] - 1) * 100, (ratio[-1] / ratio[-31] - 1) * 100
     rel = "ETH сильнее BTC" if c7 > 1 else "ETH слабее BTC" if c7 < -1 else "ETH и BTC идут вровень"
-    L.append(f"- 1D: BTC {ST[b_['s']['1D']]}, ETH {ST[e_['s']['1D']]}.")
-    L.append(f"- ETH/BTC за 7д {c7:+.1f}%, за 30д {c30:+.1f}%: {rel}.")
+    lnk.append(f"- 1D: BTC {ST[b_['s']['1D']]}, ETH {ST[e_['s']['1D']]}.")
+    lnk.append(f"- ETH/BTC за 7д {c7:+.1f}%, за 30д {c30:+.1f}%: {rel}.")
     spx = get_spx()
     if spx is not None:
-        L.append(f"- S&P 500 за последнюю сессию {spx:+.1f}%.")
-    ev = event_line()
-    if ev:
-        L.append(f"- События: {ev}")
-    L += ["", "Обучающий разбор по формулам, не рекомендация."]
-    return "\n".join(L)
+        lnk.append(f"- S&P 500 за последнюю сессию {spx:+.1f}%.")
+
+    parts = [head, top, scen, lev, tr, ph, mom, vol, der, lnk, ["Обучающий разбор по формулам, не рекомендация."]]
+    out = []
+    for part in parts:
+        out += part + [""]
+    return "\n".join(out).rstrip()
 
 
 # ---------- telegram ----------
