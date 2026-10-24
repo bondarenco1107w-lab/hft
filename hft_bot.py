@@ -96,6 +96,8 @@ def get_liq(sym, price, mult, hours=6):
         if not d:
             return None
         b = max(d, key=d.get)
+        if d[b] < 1e6:
+            return None
         return f"{fmt(b * step)}–{fmt((b + 1) * step)} (${d[b] / 1e6:.1f}M)"
     return top(up), top(dn)
 
@@ -221,19 +223,24 @@ def sr_levels(b4, bd, price):
 
 
 def sweep(b, price, sup, res, recent=6):
-    """Тень за зону с возвратом: минимум под поддержкой или максимум над сопротивлением."""
+    """Тень за зону с возвратом. Возвращает (текст, направление, подтверждён ли закрытием 4H)."""
     best = None
+    last = b[-2]["c"]  # последняя закрытая 4H
     for z in sup:
         hit = [x for x in b[-recent:] if x["l"] < z[2] and x["c"] > z[2]]
         if hit and price > z[2] and (not best or z[1] > best[0]):
             low = min(x["l"] for x in hit)
-            best = (z[1], f"Минимум {fmt(low)} снят под поддержку {zone(z[0], z[2], z[3])} ({z[1]} кас.), цена вернулась выше: сигнал отскока, подтверждение — закрытие 4H выше {fmt(z[3])}.")
+            conf = last > z[3]
+            tail = "подтверждён закрытием 4H выше" if conf else "подтверждение — закрытие 4H выше"
+            best = (z[1], f"Минимум {fmt(low)} снят под поддержку {zone(z[0], z[2], z[3])} ({z[1]} кас.), цена вернулась выше: сигнал отскока, {tail} {fmt(z[3])}.", "bull", conf)
     for z in res:
         hit = [x for x in b[-recent:] if x["h"] > z[3] and x["c"] < z[3]]
         if hit and price < z[3] and (not best or z[1] > best[0]):
             high = max(x["h"] for x in hit)
-            best = (z[1], f"Максимум {fmt(high)} снят над сопротивлением {zone(z[0], z[2], z[3])} ({z[1]} кас.), цена вернулась ниже: сигнал снижения, подтверждение — закрытие 4H ниже {fmt(z[2])}.")
-    return best[1] if best else None
+            conf = last < z[2]
+            tail = "подтверждён закрытием 4H ниже" if conf else "подтверждение — закрытие 4H ниже"
+            best = (z[1], f"Максимум {fmt(high)} снят над сопротивлением {zone(z[0], z[2], z[3])} ({z[1]} кас.), цена вернулась ниже: сигнал снижения, {tail} {fmt(z[2])}.", "bear", conf)
+    return best[1:] if best else None
 
 
 # ---------- analysis ----------
@@ -360,7 +367,9 @@ def report(a, other):
         top.append(f"⚠️ {ev}")
     sw = sweep(a["h4"], price, ksup, kres)
     if sw:
-        top.append(sw)
+        top.append(sw[0])
+        if sw[2] and bs in ("bull", "bear") and sw[1] != bs:
+            top[0] = top[0][:-1] + " (ослаблен ложным пробоем)."
 
     # 2. Уровни
     lev = ["📐 Уровни (swing-точки 4H и 1D, число касаний):",
@@ -444,6 +453,8 @@ def report(a, other):
         der.append(f"- OI за 24ч {oi:+.1f}%, цена {pch:+.1f}%: {v}.")
     if not a.get("liq"):
         der.append("- Ликвидации за 6ч: нет данных.")
+    elif not (a["liq"][0] or a["liq"][1]):
+        der.append("- Ликвидации за 6ч: значимых нет (меньше $1M в одной зоне).")
     else:
         der.append(f"- Ликвидации за 6ч (не прогноз): выше цены {a['liq'][0] or 'нет'}; ниже {a['liq'][1] or 'нет'}.")
 
