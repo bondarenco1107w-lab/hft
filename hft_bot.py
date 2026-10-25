@@ -495,20 +495,23 @@ def report(a, other):
 
 
 # ---------- news ----------
-NEWS_HOURS = 24
 UA = {"User-Agent": "Mozilla/5.0 (compatible; hft-news-bot/1.0)"}
-# (источник, адрес RSS, вес источника)
+# (источник, адрес RSS, вес источника, всегда показывать). Эксперты не отбираются по словам и молча пропускаются при ошибке.
 FEEDS = [
-    ("Fed", "https://www.federalreserve.gov/feeds/press_monetary.xml", 5),
-    ("Fed", "https://www.federalreserve.gov/feeds/press_all.xml", 4),
-    ("SEC", "https://www.sec.gov/news/pressreleases.rss", 4),
-    ("BLS", "https://www.bls.gov/feed/bls_latest.rss", 5),
-    ("Bloomberg", "https://feeds.bloomberg.com/markets/news.rss", 3),
-    ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/", 2),
-    ("Cointelegraph", "https://cointelegraph.com/rss", 2),
-    ("The Block", "https://www.theblock.co/rss.xml", 2),
-    ("Decrypt", "https://decrypt.co/feed", 2),
+    ("Fed", "https://www.federalreserve.gov/feeds/press_monetary.xml", 5, False),
+    ("Fed", "https://www.federalreserve.gov/feeds/press_all.xml", 4, False),
+    ("SEC", "https://www.sec.gov/news/pressreleases.rss", 4, False),
+    ("BLS", "https://www.bls.gov/feed/bls_latest.rss", 5, False),
+    ("Bloomberg", "https://feeds.bloomberg.com/markets/news.rss", 3, False),
+    ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/", 2, False),
+    ("Cointelegraph", "https://cointelegraph.com/rss", 2, False),
+    ("The Block", "https://www.theblock.co/rss.xml", 2, False),
+    ("Decrypt", "https://decrypt.co/feed", 2, False),
+    ("Lyn Alden", "https://www.lynalden.com/feed/", 3, True),
+    ("Joseph Wang", "https://fedguy.com/feed/", 3, True),
 ]
+# Шум: прогнозы цены, реклама, обучалки, подборки
+NOISE = re.compile(r"price prediction|sponsored|presale|how to |top \d+|best (crypto|coins?)|explained|podcast|newsletter|opinion:|\bcould (hit|reach|soar|surge)\b|analyst predicts|meme ?coin|giveaway", re.I)
 # (шаблон, вес, метка). Заголовок даёт полный вес, описание половину.
 PATTERNS = [
     (r"\bfomc\b|federal open market|rate (cut|hike|decision)|interest rates?|federal funds|monetary policy", 10, "Макро"),
@@ -594,9 +597,11 @@ def fetch_feed(url):
 
 
 def _load(feed):
-    name, url, w = feed
+    name, url, w, _ = feed
     try:
-        return name, w, fetch_feed(url), None
+        items = fetch_feed(url)
+        print("feed", name, len(items), "items")
+        return name, w, items, None
     except Exception as e:
         print("feed", name, e)
         return name, w, [], e
@@ -611,24 +616,10 @@ def similar(a, b):
     return inter >= 3 and inter / max(1, min(len(a), len(b))) >= 0.6
 
 
-def collect_news():
-    now = datetime.now(timezone.utc)
-    pool, failed = [], []
-    with ThreadPoolExecutor(max_workers=len(FEEDS)) as ex:
-        for name, w, items, err in ex.map(_load, FEEDS):
-            if err is not None and name not in failed:
-                failed.append(name)
-            for it in items:
-                age = (now - it["t"]).total_seconds() / 3600
-                if age > NEWS_HOURS or age < -1:
-                    continue
-                kw, tag = score_text(it["title"], it["desc"])
-                if kw < 5:
-                    continue
-                pool.append({**it, "src": name, "w": w, "kw": kw, "tag": tag, "age": max(age, 0)})
-    pool.sort(key=lambda x: -(x["kw"] + x["w"]))
+def select_news(sub):
+    sub = sorted(sub, key=lambda x: -(x["kw"] + x["w"]))
     clusters = []
-    for it in pool:
+    for it in sub:
         tk = tokens(it["title"])
         for c in clusters:
             if (it["link"] and it["link"] == c["link"]) or similar(tk, c["tk"]):
@@ -640,7 +631,44 @@ def collect_news():
         fresh = 6 if c["age"] < 3 else 3 if c["age"] < 8 else 1 if c["age"] < 16 else 0
         c["total"] = c["kw"] + c["w"] + fresh + 2 * (len(c["srcs"]) - 1)
     clusters.sort(key=lambda c: -c["total"])
-    return clusters[:8], failed
+    strong = [c for c in clusters if c["kw"] >= 5 or c["always"]]
+    weak = [c for c in clusters if not (c["kw"] >= 5 or c["always"])]
+    top = strong[:8]
+    if len(top) < 5:  # тихий день: добираем лучшие из остальных до пяти
+        top += weak[:5 - len(top)]
+    return top, len(strong)
+
+
+def collect_news():
+    """Окно 24ч; если важных меньше пяти, расширяем до 48ч, потом до 72ч (выходные)."""
+    now = datetime.now(timezone.utc)
+    raw, failed, ages = [], [], []
+    with ThreadPoolExecutor(max_workers=len(FEEDS)) as ex:
+        for feed, (name, w, items, err) in zip(FEEDS, ex.map(_load, FEEDS)):
+            always = feed[3]
+            if err is not None and not always and name not in failed:
+                failed.append(name)
+            for it in items:
+                age = (now - it["t"]).total_seconds() / 3600
+                if age > 72 or age < -1:
+                    continue
+                ages.append(age)
+                if "/videos/" in it["link"]:
+                    continue
+                if always:
+                    kw, tag = 4, "Эксперт"
+                else:
+                    if NOISE.search(it["title"]):
+                        continue
+                    kw, tag = score_text(it["title"], it["desc"])
+                    if kw < 3:
+                        continue
+                raw.append({**it, "src": name, "w": w, "kw": kw, "tag": tag, "always": always, "age": max(age, 0)})
+    for hrs in (24, 48, 72):
+        top, nstrong = select_news([x for x in raw if x["age"] <= hrs])
+        if nstrong >= 5:
+            break
+    return top, failed, sum(1 for a in ages if a <= hrs), hrs
 
 
 def ago(h):
@@ -648,18 +676,34 @@ def ago(h):
     return f"{m} мин назад" if m < 60 else f"{m // 60} ч назад"
 
 
+def tr(text):
+    """Перевод заголовка на русский через открытый эндпоинт Google. При сбое остаётся оригинал."""
+    try:
+        r = requests.get("https://translate.googleapis.com/translate_a/single",
+                         params={"client": "gtx", "sl": "auto", "tl": "ru", "dt": "t", "q": text}, timeout=10)
+        r.raise_for_status()
+        return "".join(x[0] for x in r.json()[0] if x and x[0]) or text
+    except Exception as e:
+        print("tr", e)
+        return text
+
+
 def news_text():
-    items, failed = collect_news()
-    L = [f"📰 Главные новости за {NEWS_HOURS}ч · {time.strftime('%d.%m %H:%M', time.gmtime())} UTC"]
+    items, failed, seen, hrs = collect_news()
+    L = [f"📰 Главные новости за {hrs}ч · {time.strftime('%d.%m %H:%M', time.gmtime())} UTC"]
     ev = event_line()
     if ev:
         L.append(f"⚠️ {ev}")
     L.append("")
     if not items:
         L.append("Важных новостей по источникам не найдено.")
+    else:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            titles = list(ex.map(tr, [c["title"] for c in items]))
     for i, c in enumerate(items, 1):
         dots = "🔴🔴" if c["total"] >= 20 else "🔴" if c["total"] >= 14 else "⚪"
-        title = c["title"] if len(c["title"]) <= 160 else c["title"][:157] + "..."
+        title = titles[i - 1]
+        title = title if len(title) <= 170 else title[:167] + "..."
         L.append(f"{i}. {dots} [{c['tag']}] {title}")
         L.append(f"   {', '.join(sorted(c['srcs']))} · {ago(c['age'])}")
         if c["link"]:
@@ -667,8 +711,20 @@ def news_text():
         L.append("")
     if failed:
         L.append("Не ответили: " + ", ".join(failed) + ".")
+    L.append(f"Просмотрено {seen} новостей за {hrs}ч, в списке {len(items)}. Заголовки переведены автоматически.")
     L.append("Бот ранжирует важность, направление рынка не оценивает.")
-    return "\n".join(L)[:4000]
+    return "\n".join(L)
+
+
+def send_long(text):
+    chunk = ""
+    for block in text.split("\n\n"):
+        if chunk and len(chunk) + len(block) + 2 > 3800:
+            send(chunk, preview=False)
+            chunk = ""
+        chunk = (chunk + "\n\n" + block) if chunk else block
+    if chunk:
+        send(chunk, preview=False)
 
 
 # ---------- telegram ----------
@@ -676,6 +732,7 @@ def send(text, keyboard=True, preview=True):
     body = {"chat_id": CHAT, "text": text}
     if not preview:
         body["disable_web_page_preview"] = True
+        body["link_preview_options"] = {"is_disabled": True}
     if keyboard:
         body["reply_markup"] = KEYBOARD
     try:
@@ -703,7 +760,7 @@ def handle(ups):
         send("Выбери кнопкой ниже: монета (отчёт приходит примерно через минуту) или Новости.")
     if news:
         try:
-            send(news_text(), preview=False)
+            send_long(news_text())
         except Exception as e:
             print("news", e)
             traceback.print_exc()
