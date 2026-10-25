@@ -1,9 +1,13 @@
 import os
 import json
 import math
+import re
 import time
 import traceback
 import requests
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
+from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
 
 TOKEN = os.environ["BOT_TOKEN"]
@@ -13,7 +17,7 @@ TG = f"https://api.telegram.org/bot{TOKEN}"
 NAMES = {"BTC_USDT": "BTC", "ETH_USDT": "ETH"}
 ST = {"bull": "бычья", "bear": "медвежья", "range": "боковая"}
 DIR = {"bull": "вверх", "bear": "вниз", "range": "боковик"}
-KEYBOARD = {"keyboard": [["BTC", "ETH", "Оба"]], "resize_keyboard": True, "is_persistent": True}
+KEYBOARD = {"keyboard": [["BTC", "ETH", "Оба"], ["Новости"]], "resize_keyboard": True, "is_persistent": True}
 
 # Календарь событий, время UTC (США: до 1 ноября EDT, после EST). Новые даты добавляй сюда же.
 EVENTS = [
@@ -328,7 +332,8 @@ def report(a, other):
     i_lo = min(range(len(w7)), key=lambda i: w7[i]["l"])
 
     def pc(x):
-        return f"{(x / price - 1) * 100:+.1f}%"
+        v = (x / price - 1) * 100
+        return f"{v:+.2f}%" if abs(v) < 0.1 else f"{v:+.1f}%"
 
     head = [f"{NAMES[sym]} · {fmt(price)} · {time.strftime('%d.%m %H:%M', time.gmtime())} UTC"]
 
@@ -489,9 +494,188 @@ def report(a, other):
     return "\n".join(out).rstrip()
 
 
+# ---------- news ----------
+NEWS_HOURS = 24
+UA = {"User-Agent": "Mozilla/5.0 (compatible; hft-news-bot/1.0)"}
+# (источник, адрес RSS, вес источника)
+FEEDS = [
+    ("Fed", "https://www.federalreserve.gov/feeds/press_monetary.xml", 5),
+    ("Fed", "https://www.federalreserve.gov/feeds/press_all.xml", 4),
+    ("SEC", "https://www.sec.gov/news/pressreleases.rss", 4),
+    ("BLS", "https://www.bls.gov/feed/bls_latest.rss", 5),
+    ("Bloomberg", "https://feeds.bloomberg.com/markets/news.rss", 3),
+    ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/", 2),
+    ("Cointelegraph", "https://cointelegraph.com/rss", 2),
+    ("The Block", "https://www.theblock.co/rss.xml", 2),
+    ("Decrypt", "https://decrypt.co/feed", 2),
+]
+# (шаблон, вес, метка). Заголовок даёт полный вес, описание половину.
+PATTERNS = [
+    (r"\bfomc\b|federal open market|rate (cut|hike|decision)|interest rates?|federal funds|monetary policy", 10, "Макро"),
+    (r"\bpowell\b|\bwarsh\b|fed chair|federal reserve", 3, "Макро"),
+    (r"\bcpi\b|consumer price index|non-?farm payrolls|employment situation|jobs report", 12, "Макро"),
+    (r"inflation|\bpce\b|\bppi\b|payrolls|unemployment rate|jobless", 7, "Макро"),
+    (r"treasury (yield|auction|secretary)|10-year|30-year|bond yield", 6, "Макро"),
+    (r"\btariffs?\b|trade war|sanction", 6, "Макро"),
+    (r"recession|\bgdp\b|debt ceiling|government shutdown|credit rating|downgrade", 5, "Макро"),
+    (r"bank of japan|\bboj\b|yen carry|\becb\b|\bpboc\b", 6, "Макро"),
+    (r"dollar index|\bdxy\b", 4, "Макро"),
+    (r"s&p 500|nasdaq|sell-?off|market crash|stocks (fall|tumble|rally|surge|plunge)", 4, "Макро"),
+    (r"\bsec\b|\bcftc\b", 5, "Регулятор"),
+    (r"\betfs?\b", 6, "ETF"),
+    (r"approv|reject|lawsuit|\bsued\b|settlement|indict|\bcourt\b|ruling", 4, "Регулятор"),
+    (r"\bban(s|ned)?\b|crackdown|licen[sc]e|legaliz|regulat", 4, "Регулятор"),
+    (r"strategic (bitcoin )?reserve|bitcoin reserve|clarity act|genius act|stablecoin (bill|law|act)|crypto (bill|law|act)|\bsenate\b|\bcongress\b", 6, "Регулятор"),
+    (r"hack|exploit|stolen|drained|breach|rug ?pull", 9, "Безопасность"),
+    (r"bankrupt|insolven|collapse|halts? withdrawals|de-?peg|liquidation", 9, "Риск"),
+    (r"\bbinance\b|\bcoinbase\b|\bokx\b|\bbybit\b|\bkraken\b|\btether\b|\busdt\b|\busdc\b|\bcircle\b", 3, "Биржи и стейблы"),
+    (r"microstrategy|\bsaylor\b|treasury (company|firm|reserve)", 4, "Институты"),
+    (r"blackrock|fidelity|grayscale|\bibit\b|vanguard|jpmorgan|goldman", 3, "Институты"),
+    (r"outflows?|inflows?|\bwhales?\b", 3, "Потоки"),
+    (r"all-time high|record high|\bcrash|plunge|\bsurge|\bsoar|tumble", 3, "Рынок"),
+    (r"bitcoin|\bbtc\b|ethereum|\beth\b", 2, "Крипто"),
+    (r"delist|listing|airdrop|\bfork\b|halving", 2, "Крипто"),
+]
+PATTERNS = [(re.compile(p, re.I), w, t) for p, w, t in PATTERNS]
+
+
+def score_text(title, desc):
+    hits = []
+    for rx, w, tag in PATTERNS:
+        if rx.search(title):
+            hits.append((w, tag))
+        elif rx.search(desc):
+            hits.append((w // 2, tag))
+    hits.sort(reverse=True)
+    top = hits[:2]
+    return sum(w for w, _ in top), (top[0][1] if top else "")
+
+
+def parse_dt(txt):
+    txt = (txt or "").strip()
+    try:
+        d = parsedate_to_datetime(txt)
+    except Exception:
+        try:
+            d = datetime.fromisoformat(txt.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d
+
+
+def _child(it, names):
+    for ch in it:
+        if ch.tag.split("}")[-1] in names:
+            return ch
+    return None
+
+
+def fetch_feed(url):
+    r = requests.get(url, headers=UA, timeout=15)
+    r.raise_for_status()
+    root = ET.fromstring(r.content)
+    out = []
+    for it in root.iter():
+        if it.tag.split("}")[-1] not in ("item", "entry"):
+            continue
+        t = _child(it, ("title",))
+        title = " ".join((t.text or "").split()) if t is not None else ""
+        l = _child(it, ("link",))
+        link = ((l.text or "").strip() or l.attrib.get("href", "")) if l is not None else ""
+        d = _child(it, ("description", "summary", "content"))
+        desc = " ".join(re.sub(r"<[^>]+>", " ", d.text or "").split())[:300] if d is not None else ""
+        p = _child(it, ("pubDate", "published", "updated", "date"))
+        dt = parse_dt(p.text) if p is not None else None
+        if title and dt:
+            out.append({"title": title, "link": link, "desc": desc, "t": dt})
+    return out
+
+
+def _load(feed):
+    name, url, w = feed
+    try:
+        return name, w, fetch_feed(url), None
+    except Exception as e:
+        print("feed", name, e)
+        return name, w, [], e
+
+
+def tokens(t):
+    return {w for w in re.findall(r"[a-z0-9$%.]+", t.lower()) if len(w) > 3}
+
+
+def similar(a, b):
+    inter = len(a & b)
+    return inter >= 3 and inter / max(1, min(len(a), len(b))) >= 0.6
+
+
+def collect_news():
+    now = datetime.now(timezone.utc)
+    pool, failed = [], []
+    with ThreadPoolExecutor(max_workers=len(FEEDS)) as ex:
+        for name, w, items, err in ex.map(_load, FEEDS):
+            if err is not None and name not in failed:
+                failed.append(name)
+            for it in items:
+                age = (now - it["t"]).total_seconds() / 3600
+                if age > NEWS_HOURS or age < -1:
+                    continue
+                kw, tag = score_text(it["title"], it["desc"])
+                if kw < 5:
+                    continue
+                pool.append({**it, "src": name, "w": w, "kw": kw, "tag": tag, "age": max(age, 0)})
+    pool.sort(key=lambda x: -(x["kw"] + x["w"]))
+    clusters = []
+    for it in pool:
+        tk = tokens(it["title"])
+        for c in clusters:
+            if (it["link"] and it["link"] == c["link"]) or similar(tk, c["tk"]):
+                c["srcs"].add(it["src"])
+                break
+        else:
+            clusters.append({**it, "tk": tk, "srcs": {it["src"]}})
+    for c in clusters:
+        fresh = 6 if c["age"] < 3 else 3 if c["age"] < 8 else 1 if c["age"] < 16 else 0
+        c["total"] = c["kw"] + c["w"] + fresh + 2 * (len(c["srcs"]) - 1)
+    clusters.sort(key=lambda c: -c["total"])
+    return clusters[:8], failed
+
+
+def ago(h):
+    m = int(h * 60)
+    return f"{m} мин назад" if m < 60 else f"{m // 60} ч назад"
+
+
+def news_text():
+    items, failed = collect_news()
+    L = [f"📰 Главные новости за {NEWS_HOURS}ч · {time.strftime('%d.%m %H:%M', time.gmtime())} UTC"]
+    ev = event_line()
+    if ev:
+        L.append(f"⚠️ {ev}")
+    L.append("")
+    if not items:
+        L.append("Важных новостей по источникам не найдено.")
+    for i, c in enumerate(items, 1):
+        dots = "🔴🔴" if c["total"] >= 20 else "🔴" if c["total"] >= 14 else "⚪"
+        title = c["title"] if len(c["title"]) <= 160 else c["title"][:157] + "..."
+        L.append(f"{i}. {dots} [{c['tag']}] {title}")
+        L.append(f"   {', '.join(sorted(c['srcs']))} · {ago(c['age'])}")
+        if c["link"]:
+            L.append(f"   {c['link']}")
+        L.append("")
+    if failed:
+        L.append("Не ответили: " + ", ".join(failed) + ".")
+    L.append("Бот ранжирует важность, направление рынка не оценивает.")
+    return "\n".join(L)[:4000]
+
+
 # ---------- telegram ----------
-def send(text, keyboard=True):
+def send(text, keyboard=True, preview=True):
     body = {"chat_id": CHAT, "text": text}
+    if not preview:
+        body["disable_web_page_preview"] = True
     if keyboard:
         body["reply_markup"] = KEYBOARD
     try:
@@ -501,7 +685,7 @@ def send(text, keyboard=True):
 
 
 def handle(ups):
-    want, greet = set(), False
+    want, greet, news = set(), False, False
     for u in ups:
         m = u.get("message") or {}
         if str(m.get("chat", {}).get("id")) != str(CHAT) or time.time() - m.get("date", 0) > 3600:
@@ -511,10 +695,19 @@ def handle(ups):
             want.add(t.upper() + "_USDT")
         elif t in ("оба", "both"):
             want |= {"BTC_USDT", "ETH_USDT"}
+        elif t in ("новости", "news"):
+            news = True
         elif t == "start":
             greet = True
-    if greet and not want:
-        send("Выбери монету кнопкой ниже. Отчёт приходит примерно через минуту после нажатия.")
+    if greet and not want and not news:
+        send("Выбери кнопкой ниже: монета (отчёт приходит примерно через минуту) или Новости.")
+    if news:
+        try:
+            send(news_text(), preview=False)
+        except Exception as e:
+            print("news", e)
+            traceback.print_exc()
+            send("Не получилось собрать новости, попробуй нажать ещё раз.")
     if want:
         try:
             data = {s: analyze(s) for s in ("BTC_USDT", "ETH_USDT")}
