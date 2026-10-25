@@ -219,7 +219,8 @@ def sr_levels(b4, bd, price):
     strong = [x for x in allv if x[1] >= 2] or allv
     res = sorted([x for x in strong if x[0] > price * 1.001])[:6]
     sup = sorted([x for x in strong if x[0] < price * 0.999], reverse=True)[:6]
-    return res, sup
+    inside = max([x for x in strong if x[2] <= price <= x[3] and x[1] >= 3], key=lambda x: x[1], default=None)
+    return res, sup, inside
 
 
 def sweep(b, price, sup, res, recent=6):
@@ -250,7 +251,7 @@ def analyze(sym):
     price = h1[-1]["c"]
     a = {"sym": sym, "price": price, "d": d, "h4": h4, "h1": h1}
     a["s"] = {"1W": structure(w, 2), "1D": structure(d, 2), "4H": structure(h4, 3), "1H": structure(h1, 3)}
-    a["res"], a["sup"] = sr_levels(h4, d, price)
+    a["res"], a["sup"], a["inside"] = sr_levels(h4, d, price)
     a["fr"], a["oi"], mult = get_derivs(sym)
     a["liq"] = get_liq(sym, price, mult)
     return a
@@ -319,6 +320,7 @@ def report(a, other):
     sup, res = a["sup"], a["res"]
     ksup = [z for z in sup if z[1] >= 3] or sup
     kres = [z for z in res if z[1] >= 3] or res
+    inside = a.get("inside")
     w7 = a["h4"][-42:]
     hi7 = max(x["h"] for x in w7)
     lo7 = min(x["l"] for x in w7)
@@ -332,8 +334,8 @@ def report(a, other):
 
     # 1. Итог: что делать и от каких цен
     top, scen = [], ["🧭 Сценарии:"]
-    if ksup and kres:
-        sz1, rz1 = ksup[0], kres[0]
+    if inside or (ksup and kres):
+        sz1, rz1 = (inside, inside) if inside else (ksup[0], kres[0])
         dn_e = f"Вход вниз: закрытие 4H ниже {fmt(sz1[2])} ({pc(sz1[2])})"
         up_e = f"Вход вверх: закрытие 4H выше {fmt(rz1[3])} ({pc(rz1[3])})"
         if bs == "bear":
@@ -342,7 +344,10 @@ def report(a, other):
             top += [f"Итог: уклон вверх, пока 4H не закрылся ниже {fmt(sz1[2])}.", up_e, dn_e]
         else:
             top += ["Итог: направления нет.", dn_e, up_e]
-        top.append("Пока цена между ними, входа нет.")
+        if inside:
+            top.append(f"Цена внутри зоны {zone(inside[0], inside[2], inside[3])} ({inside[1]} кас.): входа нет, пока 4H не закрылся за её границей.")
+        else:
+            top.append("Пока цена между ними, входа нет.")
 
         sz2 = next((z for z in ksup + sup if z[3] < sz1[2]), None)
         rz2 = next((z for z in kres + res if z[2] > rz1[3]), None)
@@ -442,7 +447,10 @@ def report(a, other):
         der.append("- Открытый интерес: нет данных.")
     else:
         pch = (price / a["h1"][-25]["c"] - 1) * 100
-        if pch >= 0 and oi >= 0:
+        if abs(pch) < 0.3:
+            v = ("цена на месте, OI растёт: набираются позиции, возможен резкий выход" if oi >= 0
+                 else "цена на месте, OI падает: позиции закрываются, импульса нет")
+        elif pch >= 0 and oi >= 0:
             v = "цена и OI растут: приходят новые лонги, рост подтверждён"
         elif pch >= 0:
             v = "цена растёт, OI падает: рост за счёт закрытия шортов, он слабее"
@@ -464,7 +472,10 @@ def report(a, other):
     n = min(len(b_["d"]), len(e_["d"]))
     ratio = [e_["d"][-n + i]["c"] / b_["d"][-n + i]["c"] for i in range(n)]
     c7, c30 = (ratio[-1] / ratio[-8] - 1) * 100, (ratio[-1] / ratio[-31] - 1) * 100
-    rel = "ETH сильнее BTC" if c7 > 1 else "ETH слабее BTC" if c7 < -1 else "ETH и BTC идут вровень"
+    def rw(x, t):
+        return "сильнее BTC" if x > t else "слабее BTC" if x < -t else "вровень с BTC"
+    r7, r30 = rw(c7, 1), rw(c30, 3)
+    rel = f"ETH {r7}" if r7 == r30 else f"ETH за 7д {r7}, за 30д {r30}"
     lnk.append(f"- 1D: BTC {ST[b_['s']['1D']]}, ETH {ST[e_['s']['1D']]}.")
     lnk.append(f"- ETH/BTC за 7д {c7:+.1f}%, за 30д {c30:+.1f}%: {rel}.")
     spx = get_spx()
