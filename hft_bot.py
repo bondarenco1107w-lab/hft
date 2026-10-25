@@ -587,6 +587,7 @@ def fetch_feed(url):
         title = " ".join((t.text or "").split()) if t is not None else ""
         l = _child(it, ("link",))
         link = ((l.text or "").strip() or l.attrib.get("href", "")) if l is not None else ""
+        link = link.split("?utm_")[0]
         d = _child(it, ("description", "summary", "content"))
         desc = " ".join(re.sub(r"<[^>]+>", " ", d.text or "").split())[:300] if d is not None else ""
         p = _child(it, ("pubDate", "published", "updated", "date"))
@@ -611,6 +612,27 @@ def tokens(t):
     return {w for w in re.findall(r"[a-z0-9$%.]+", t.lower()) if len(w) > 3}
 
 
+def money(text):
+    """Наибольшая сумма в долларах из заголовка ($2.6 million, $636M, $1.2B)."""
+    mult = {"billion": 1e9, "bn": 1e9, "b": 1e9, "million": 1e6, "m": 1e6, "thousand": 1e3, "k": 1e3}
+    best = 0.0
+    for n, u in re.findall(r"\$\s?(\d[\d,]*(?:\.\d+)?)\s?(billion|million|thousand|bn|m|b|k)?(?![a-z])", text.lower()):
+        try:
+            best = max(best, float(n.replace(",", "")) * mult.get(u, 1))
+        except ValueError:
+            pass
+    return best
+
+
+def nums(t):
+    out = set()
+    for n, _ in re.findall(r"(\d[\d,]*(?:\.\d+)?)\s?(billion|million|thousand|bn|m|b|k)?(?![a-z])", t.lower()):
+        d = n.replace(",", "")
+        if len(d) >= 2 and not re.fullmatch(r"20\d\d", d):
+            out.add(d)
+    return out
+
+
 def similar(a, b):
     inter = len(a & b)
     return inter >= 3 and inter / max(1, min(len(a), len(b))) >= 0.6
@@ -620,22 +642,31 @@ def select_news(sub):
     sub = sorted(sub, key=lambda x: -(x["kw"] + x["w"]))
     clusters = []
     for it in sub:
-        tk = tokens(it["title"])
+        tk, nm = tokens(it["title"]), nums(it["title"])
         for c in clusters:
-            if (it["link"] and it["link"] == c["link"]) or similar(tk, c["tk"]):
+            if ((it["link"] and it["link"] == c["link"]) or similar(tk, c["tk"])
+                    or (nm & c["nm"] and len(tk & c["tk"]) >= 2)):
                 c["srcs"].add(it["src"])
                 break
         else:
-            clusters.append({**it, "tk": tk, "srcs": {it["src"]}})
+            clusters.append({**it, "tk": tk, "nm": nm, "srcs": {it["src"]}})
     for c in clusters:
         fresh = 6 if c["age"] < 3 else 3 if c["age"] < 8 else 1 if c["age"] < 16 else 0
         c["total"] = c["kw"] + c["w"] + fresh + 2 * (len(c["srcs"]) - 1)
     clusters.sort(key=lambda c: -c["total"])
     strong = [c for c in clusters if c["kw"] >= 5 or c["always"]]
     weak = [c for c in clusters if not (c["kw"] >= 5 or c["always"])]
-    top = strong[:8]
+    top, cnt = [], {}
+    for c in strong:  # не больше 3 новостей одной метки (макро: 4), чтобы список был разнообразным
+        if cnt.get(c["tag"], 0) >= (4 if c["tag"] == "Макро" else 3):
+            continue
+        cnt[c["tag"]] = cnt.get(c["tag"], 0) + 1
+        top.append(c)
+        if len(top) == 8:
+            break
     if len(top) < 5:  # тихий день: добираем лучшие из остальных до пяти
-        top += weak[:5 - len(top)]
+        rest = [c for c in strong + weak if all(c is not t for t in top)]
+        top += rest[:5 - len(top)]
     return top, len(strong)
 
 
@@ -661,6 +692,11 @@ def collect_news():
                     if NOISE.search(it["title"]):
                         continue
                     kw, tag = score_text(it["title"], it["desc"])
+                    amt = money(it["title"])
+                    if amt and tag in ("Безопасность", "Риск"):
+                        kw = min(kw, 4) if amt < 1e7 else kw + 4 if amt >= 1e8 else kw
+                    elif amt and tag in ("ETF", "Потоки"):
+                        kw += 4 if amt >= 5e8 else 2 if amt >= 1e8 else 0
                     if kw < 3:
                         continue
                 raw.append({**it, "src": name, "w": w, "kw": kw, "tag": tag, "always": always, "age": max(age, 0)})
