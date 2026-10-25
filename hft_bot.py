@@ -349,8 +349,8 @@ def report(a, other):
         else:
             top.append("Пока цена между ними, входа нет.")
 
-        sz2 = next((z for z in ksup + sup if z[3] < sz1[2]), None)
-        rz2 = next((z for z in kres + res if z[2] > rz1[3]), None)
+        sz2 = next((z for z in ksup + sup if z[3] < sz1[2] * 0.995), None)  # цель не ближе 0.5% к входу
+        rz2 = next((z for z in kres + res if z[2] > rz1[3] * 1.005), None)
         dn_stop, dn_tgt = sz1[3] * 1.001, (sz2[3] if sz2 else None)
         up_stop, up_tgt = rz1[2] * 0.999, (rz2[2] if rz2 else None)
 
